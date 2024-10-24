@@ -1,5 +1,5 @@
 # go-query-nft
-use go to query nft information
+use go to query usdc
 
 the golang version of https://github.com/web3-interaction-examples/viem-query-usdc
 
