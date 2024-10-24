@@ -94,8 +94,14 @@ func getUSDCTransfers(client *ethclient.Client, startBlock uint64, endBlock uint
 		to := common.HexToAddress(vLog.Topics[2].Hex())
 		amount := new(big.Int).SetBytes(vLog.Data)
 		amount = new(big.Int).Div(amount, divisor)
-		fmt.Printf("Block #%d: Transfer from %s to %s, amount: %s USDC\n",
-			vLog.BlockNumber, from.Hex(), to.Hex(), amount.String())
+
+		transferType := "Transfer"
+		if from == common.HexToAddress("0x0000000000000000000000000000000000000000") {
+			transferType = "Mint"
+		}
+
+		fmt.Printf("Block #%d: %s from %s to %s, amount: %s USDC\n",
+			vLog.BlockNumber, transferType, from.Hex(), to.Hex(), amount.String())
 	}
 
 	return nil
