@@ -1,98 +1,130 @@
 package main
 
 import (
-	"flag"
+	"context"
 	"fmt"
 	"log"
 	"math/big"
 	"strings"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
-// NFT contract address
-// https://etherscan.io/token/0x0483b0dfc6c78062b9e999a82ffb795925381415#code
-const NFT_CONTRACT_ADDRESS = "0x0483b0dfc6c78062b9e999a82ffb795925381415"
+// USDC contract address
+const USDC_CONTRACT_ADDRESS = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
 
-// NFT ABI struct
-type NFT struct {
-	//  function ownerOf(uint256 tokenId) external view returns (address owner);
-	OwnerOf func(opts *bind.CallOpts, tokenId *big.Int) (common.Address, error)
-	//  function tokenURI(uint256 tokenId) external view returns (string memory);
-	TokenURI func(opts *bind.CallOpts, _tokenId *big.Int) (string, error)
+// Transfer event signature
+const TRANSFER_EVENT_SIGNATURE = "Transfer(address,address,uint256)"
+
+// USDC interface
+type USDC interface {
+	Decimals(opts *bind.CallOpts) (uint8, error)
 }
 
 func main() {
-
-	tokenId := flag.Int64("tokenId", 1, "tokenId to query")
-	flag.Parse()
-
-	// connect to ethereum mainnet
-	client, err := ethclient.Dial("https://cloudflare-eth.com")
+	// Connect to the Ethereum mainnet
+	client, err := ethclient.Dial("https://eth.llamarpc.com")
 	if err != nil {
-		log.Fatalf("connect to ethereum mainnet failed: %v", err)
+		log.Fatalf("Failed to connect to the Ethereum mainnet: %v", err)
 	}
 
-	// create contract instance
-	nftAddress := common.HexToAddress(NFT_CONTRACT_ADDRESS)
-	nftAbi, err := abi.JSON(strings.NewReader(NFT_ABI))
+	// Get the USDC contract instance
+	usdcAddress := common.HexToAddress(USDC_CONTRACT_ADDRESS)
+	usdc, err := NewUSDC(usdcAddress, client)
 	if err != nil {
-		log.Fatalf("parse ABI failed: %v", err)
-	}
-	nftContract := bind.NewBoundContract(nftAddress, nftAbi, client, client, client)
-
-	nft := &NFT{
-		// bind ownerOf function
-		OwnerOf: func(opts *bind.CallOpts, tokenId *big.Int) (common.Address, error) {
-			var out []interface{}
-			err := nftContract.Call(opts, &out, "ownerOf", tokenId)
-			if err != nil {
-				return common.Address{}, err
-			}
-			return *abi.ConvertType(out[0], new(common.Address)).(*common.Address), nil
-		},
-		// bind tokenURI function
-		TokenURI: func(opts *bind.CallOpts, _tokenId *big.Int) (string, error) {
-			var out []interface{}
-			err := nftContract.Call(opts, &out, "tokenURI", _tokenId)
-			if err != nil {
-				return "", err
-			}
-			return *abi.ConvertType(out[0], new(string)).(*string), nil
-		},
+		log.Fatalf("Failed to create USDC contract instance: %v", err)
 	}
 
-	// get NFT info
-	err = getNFTInfo(*nft, big.NewInt(*tokenId))
+	// Get the USDC decimal places
+	decimals, err := usdc.Decimals(&bind.CallOpts{})
 	if err != nil {
-		log.Fatalf("get NFT info failed: %v", err)
+		log.Fatalf("Failed to get USDC decimal places: %v", err)
+	}
+
+	fmt.Printf("USDC decimal places: %d\n", decimals)
+
+	// Get the latest block number
+	header, err := client.HeaderByNumber(context.Background(), nil)
+	if err != nil {
+		log.Fatalf("Failed to get the latest block number: %v", err)
+	}
+	latestBlock := header.Number.Uint64()
+
+	// Calculate the start block number (last 100 blocks)
+	startBlock := latestBlock - 99
+	if startBlock < 0 {
+		startBlock = 0
+	}
+
+	// Query USDC transfer records
+	err = getUSDCTransfers(client, startBlock, latestBlock, decimals)
+	if err != nil {
+		log.Fatalf("Failed to query USDC transfer records: %v", err)
 	}
 }
 
-func getNFTInfo(nft NFT, tokenId *big.Int) error {
-	fmt.Println("start getting NFT info...")
-	fmt.Println("contract address:", NFT_CONTRACT_ADDRESS)
-	fmt.Printf("Token ID: %s\n", tokenId.String())
+func getUSDCTransfers(client *ethclient.Client, startBlock uint64, endBlock uint64, decimals uint8) error {
+	usdcAddress := common.HexToAddress(USDC_CONTRACT_ADDRESS)
+	transferSig := []byte(TRANSFER_EVENT_SIGNATURE)
+	transferTopic := crypto.Keccak256Hash(transferSig)
 
-	// get NFT owner address
-	ownerAddress, err := nft.OwnerOf(&bind.CallOpts{}, tokenId)
-	if err != nil {
-		return fmt.Errorf("get owner address failed: %v", err)
+	query := ethereum.FilterQuery{
+		FromBlock: big.NewInt(int64(startBlock)),
+		ToBlock:   big.NewInt(int64(endBlock)),
+		Addresses: []common.Address{usdcAddress},
+		Topics:    [][]common.Hash{{transferTopic}},
 	}
-	fmt.Printf("Token ID %s owner address: %s\n", tokenId.String(), ownerAddress.Hex())
 
-	// get NFT metadata URI
-	tokenURI, err := nft.TokenURI(&bind.CallOpts{}, tokenId)
+	logs, err := client.FilterLogs(context.Background(), query)
 	if err != nil {
-		return fmt.Errorf("get metadata URI failed: %v", err)
+		return fmt.Errorf("Failed to filter logs: %v", err)
 	}
-	fmt.Printf("Token ID %s metadata URI: %s\n", tokenId.String(), tokenURI)
+
+	fmt.Printf("Found %d USDC transfer records between blocks %d and %d\n", len(logs), startBlock, endBlock)
+
+	divisor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil)
+
+	for _, vLog := range logs {
+		from := common.HexToAddress(vLog.Topics[1].Hex())
+		to := common.HexToAddress(vLog.Topics[2].Hex())
+		amount := new(big.Int).SetBytes(vLog.Data)
+		amount = new(big.Int).Div(amount, divisor)
+		fmt.Printf("Block #%d: Transfer from %s to %s, amount: %s USDC\n",
+			vLog.BlockNumber, from.Hex(), to.Hex(), amount.String())
+	}
 
 	return nil
 }
 
-// NFT_ABI
-const NFT_ABI = `[{"inputs":[],"stateMutability":"nonpayable","type":"constructor"},{"inputs":[{"internalType":"address","name":"owner","type":"address"}],"name":"OwnableInvalidOwner","type":"error"},{"inputs":[{"internalType":"address","name":"account","type":"address"}],"name":"OwnableUnauthorizedAccount","type":"error"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"owner","type":"address"},{"indexed":true,"internalType":"address","name":"approved","type":"address"},{"indexed":true,"internalType":"uint256","name":"tokenId","type":"uint256"}],"name":"Approval","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"owner","type":"address"},{"indexed":true,"internalType":"address","name":"operator","type":"address"},{"indexed":false,"internalType":"bool","name":"approved","type":"bool"}],"name":"ApprovalForAll","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"previousOwner","type":"address"},{"indexed":true,"internalType":"address","name":"newOwner","type":"address"}],"name":"OwnershipTransferred","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"from","type":"address"},{"indexed":true,"internalType":"address","name":"to","type":"address"},{"indexed":true,"internalType":"uint256","name":"tokenId","type":"uint256"}],"name":"Transfer","type":"event"},{"inputs":[],"name":"Price","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"TotalNum","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"_address","type":"address"}],"name":"addToBlacklist","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"_to","type":"address"},{"internalType":"uint256","name":"numberOfTokens","type":"uint256"}],"name":"airdrop","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"tokenId","type":"uint256"}],"name":"approve","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"owner","type":"address"}],"name":"balanceOf","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"blacklist","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"tokenId","type":"uint256"}],"name":"getApproved","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"owner","type":"address"},{"internalType":"address","name":"operator","type":"address"}],"name":"isApprovedForAll","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"account","type":"address"}],"name":"isContract","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"listClaimed","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"mint","outputs":[],"stateMutability":"payable","type":"function"},{"inputs":[],"name":"name","outputs":[{"internalType":"string","name":"","type":"string"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"nextOwnerToExplicitlySet","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"owner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"tokenId","type":"uint256"}],"name":"ownerOf","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"publicMintEnabled","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"_address","type":"address"}],"name":"removeFromBlacklist","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"renounceOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"from","type":"address"},{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"tokenId","type":"uint256"}],"name":"safeTransferFrom","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"from","type":"address"},{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"tokenId","type":"uint256"},{"internalType":"bytes","name":"data","type":"bytes"}],"name":"safeTransferFrom","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"operator","type":"address"},{"internalType":"bool","name":"approved","type":"bool"}],"name":"setApprovalForAll","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"string","name":"baseURI_","type":"string"}],"name":"setBaseURI","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"newPrice","type":"uint256"}],"name":"setPrice","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"bool","name":"enable","type":"bool"}],"name":"setPublicMint","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"bytes32","name":"mroot","type":"bytes32"},{"internalType":"uint256","name":"step","type":"uint256"}],"name":"setRoot","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"bool","name":"enable","type":"bool"},{"internalType":"uint256","name":"step","type":"uint256"}],"name":"setWlMint","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"bytes4","name":"interfaceId","type":"bytes4"}],"name":"supportsInterface","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"symbol","outputs":[{"internalType":"string","name":"","type":"string"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"index","type":"uint256"}],"name":"tokenByIndex","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"owner","type":"address"},{"internalType":"uint256","name":"index","type":"uint256"}],"name":"tokenOfOwnerByIndex","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"_tokenId","type":"uint256"}],"name":"tokenURI","outputs":[{"internalType":"string","name":"","type":"string"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"totalSupply","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"from","type":"address"},{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"tokenId","type":"uint256"}],"name":"transferFrom","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"newOwner","type":"address"}],"name":"transferOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"withdraw","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"wlMintStep1Enabled","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"wlMintStep2Enabled","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"bytes32[]","name":"proof","type":"bytes32[]"}],"name":"wlmint1","outputs":[],"stateMutability":"payable","type":"function"},{"inputs":[{"internalType":"bytes32[]","name":"proof","type":"bytes32[]"}],"name":"wlmint2","outputs":[],"stateMutability":"payable","type":"function"},{"inputs":[],"name":"wlroot","outputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"stateMutability":"view","type":"function"}]`
+// NewUSDC creates a new USDC instance
+func NewUSDC(address common.Address, backend bind.ContractBackend) (USDC, error) {
+	parsed, err := abi.JSON(strings.NewReader(USDCABI))
+	if err != nil {
+		return nil, err
+	}
+	contract := bind.NewBoundContract(address, parsed, backend, backend, backend)
+	return &usdcCaller{contract: contract}, nil
+}
+
+// USDC ABI
+const USDCABI = `[{"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"},{"constant":false,"inputs":[{"name":"newImplementation","type":"address"}],"name":"upgradeTo","outputs":[],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":false,"inputs":[{"name":"newImplementation","type":"address"},{"name":"data","type":"bytes"}],"name":"upgradeToAndCall","outputs":[],"payable":true,"stateMutability":"payable","type":"function"},{"constant":true,"inputs":[],"name":"implementation","outputs":[{"name":"","type":"address"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":false,"inputs":[{"name":"newAdmin","type":"address"}],"name":"changeAdmin","outputs":[],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":true,"inputs":[],"name":"admin","outputs":[{"name":"","type":"address"}],"payable":false,"stateMutability":"view","type":"function"},{"inputs":[{"name":"_implementation","type":"address"}],"payable":false,"stateMutability":"nonpayable","type":"constructor"},{"payable":true,"stateMutability":"payable","type":"fallback"},{"anonymous":false,"inputs":[{"indexed":false,"name":"previousAdmin","type":"address"},{"indexed":false,"name":"newAdmin","type":"address"}],"name":"AdminChanged","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"name":"implementation","type":"address"}],"name":"Upgraded","type":"event"}]`
+
+// struct
+type usdcCaller struct {
+	contract *bind.BoundContract
+}
+
+// Decimals
+func (u *usdcCaller) Decimals(opts *bind.CallOpts) (uint8, error) {
+	var out []interface{}
+	err := u.contract.Call(opts, &out, "decimals")
+	if err != nil {
+		return 0, err
+	}
+	return *abi.ConvertType(out[0], new(uint8)).(*uint8), nil
+}

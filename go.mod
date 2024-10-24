@@ -1,4 +1,4 @@
-module go_query_nft_info
+module go_query_usdc
 
 go 1.22.5
 
